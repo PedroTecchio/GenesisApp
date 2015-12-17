@@ -1,13 +1,16 @@
 package edu.upenn.genesisapp;
 
-import android.annotation.SuppressLint;
+/*
+ * Developer: Pedro Paulo Ventura Tecchio
+ * E-mail: tecchio at seas dot upenn dot edu
+ * Colaborators: Guan Sun and Christopher Clingerman
+ * Institution: University of Pennsylvania
+ */
+
 import android.graphics.Bitmap;
 import android.os.Bundle;
-import android.os.Handler;
-import android.support.v7.app.ActionBar;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
-import android.view.MotionEvent;
 import android.view.View;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -22,47 +25,59 @@ import java.net.URISyntaxException;
 import java.util.Timer;
 import java.util.TimerTask;
 
-/**
- * An example full-screen activity that shows and hides the system UI (i.e.
- * status bar and navigation/system bar) with user interaction.
+/*
+ * The following code was created towards the integration of a Project Tango device with the ROS
+ * - Robotic Operation System environment. The main goal was to enable communications between then.
+ *
+ * We achieved this by exploring websockets implementations in Android,
+ * https://github.com/TooTallNate/Java-WebSocket, and in ROS, http://wiki.ros.org/rosbridge_suite.
+ *
+ * This Android Application was intended to be always in full screen mode and that is why we have
+ * this class name. Later on, due to time constraints we dropped the full screen mode and kept a
+ * standard one, but we did not change the name of this class.
+ *
+ * This code should be viewed as a first attempt towards our goal and has a LOT of space for
+ * improvement, for example: better screen management, use of a media codec to enable video
+ * streaming decoding, message acks, memory management and completion of the joystick function.
+ *
+ * App actions:
+ * - Creates the websocket connection with the ROSBridge acting as a server in the robot
+ * - Switches screens according to the state of the execution
+ * - Sends and receive message using topics
+ * - 00Able to show received images without color decompression and with delays.
  */
+
+
 public class FullscreenActivity extends AppCompatActivity {
-    /**
-     * Whether or not the system UI should be auto-hidden after
-     * {@link #AUTO_HIDE_DELAY_MILLIS} milliseconds.
-     */
-    private static final boolean AUTO_HIDE = true;
 
-    /**
-     * If {@link #AUTO_HIDE} is set, the number of milliseconds to wait after
-     * user interaction before hiding the system UI.
-     */
-    private static final int AUTO_HIDE_DELAY_MILLIS = 3000;
-
-    /**
-     * Some older devices needs a small delay between UI widget updates
-     * and a change of the status and navigation bar.
-     */
-    private static final int UI_ANIMATION_DELAY = 300;
-
-    private View mContentView;
-    private View mControlsView;
+    // All the different screens (views) we have.
     private View mStartView;
-
-    private boolean mVisible;
-
-    private TextView textMsg1;
-    private TextView textMsg2;
-
+    private View mChooseTaskView;
+    private View mChooseLocationView;
+    private View mChooseObjectView;
+    private View mExecutingView;
+    private View mGoalAchievedView;
+    private View mJoystickView;
+    private View mFollowFacesView;
+    // Specific views we need to access at some point in the code.
+    private ImageView imageView;
+    private TextView goalTextView;
+    // Websocket related variables.
     private WebSocketClient mWebSocketClient;
     private boolean mWebSocketStatus = false;
-
-    private ImageView imageView;
-
+    // Definitions of topic names and types
+    private final String ANDROID_CMD_TOPIC = "/android_ui";
+    private final String ANDROID_CMD_TYPE = "std_msgs/String";
+    private final String ANDROID_FB_TOPIC = "/android_fb";
+    private final String ANDROID_FB_TYPE = "std_msgs/String";
+    private final String CAMERA_TOPIC = "/Lifecam/image_raw";
+    private final String TELEOP_TOPIC = "/cmd_vel_mux/input/teleop";
+    private final String TELEOP_TYPE = "/geometry_msgs/Twist";
+    // Variables needed to send CMD_VEL messages to move the robot
     private double[] cmd_vel_linear = {0.0, 0.0, 0.0};
     private double[] cmd_vel_angular = {0.0, 0.0, 0.0};
     private boolean enableCmdVelMsg = false;
-
+    // Variables related to image parsing
     private boolean hasImage = false;
     class ImageBuffer {
         byte[] data;
@@ -76,8 +91,17 @@ public class FullscreenActivity extends AppCompatActivity {
         }
     }
 
+
+    /*
+     * We use to buffers to store received image data, new_one always keep the last data received
+     * and is usually overwritten. old_one receives a copy of new_one only when we process an image
+     * and is only used within the thread function that parses images.
+     */
     private ImageBuffer new_one = new ImageBuffer();
     private ImageBuffer old_one = new ImageBuffer();
+    // Variables used to specify objectives to the robot
+    private String location = "GRASP Lab";
+    private String object = "Object1";
 
 
     @Override
@@ -86,52 +110,142 @@ public class FullscreenActivity extends AppCompatActivity {
 
         setContentView(R.layout.activity_fullscreen);
 
-        mVisible = false;
-//        mControlsView = findViewById(R.id.fullscreen_content_controls);
-        mContentView = findViewById(R.id.fullscreen_content);
-        mStartView = findViewById(R.id.start_content);
+        mStartView          = findViewById(R.id.start_content);
+        mChooseTaskView     = findViewById(R.id.choose_task_content);
+        mChooseLocationView = findViewById(R.id.choose_location_content);
+        mChooseObjectView   = findViewById(R.id.choose_object_content);
+        mExecutingView      = findViewById(R.id.executing_content);
+        mGoalAchievedView   = findViewById(R.id.goal_achieved_content);
+        mJoystickView       = findViewById(R.id.joystick_content);
+        mFollowFacesView    = findViewById(R.id.follow_faces_content);
 
-        textMsg2 = (TextView) findViewById(R.id.text_msg_2);
-        textMsg1 = (TextView) findViewById(R.id.text_msg_1);
+        imageView = (ImageView) findViewById(R.id.joystick_content_imageView1);
+        goalTextView = (TextView) findViewById(R.id.goal_achieved_content_text_view);
 
-        hide();
-        imageView = (ImageView) findViewById(R.id.imageView1);
-
+        // This creates the websocket connection. Should be interesting to change later to an app
+        // pre init step.
         connectWebSocket();
 
+        // Switch to connect button view
+        switchViews(0);
+
+        /* Creates a thread responsible for continually sending CMD_VEL messages to move the robot
+         * around in the TELEOP mode. If the correct topic and the correct controller are enable in
+         * the robot, then it should work nicely.
+         */
         new Thread(new Runnable() {
             public void run() {
                 Timer timer = new Timer();
+                // Sends a message every 100 ms, may be delayed by other tasks.
                 timer.schedule(new sendCmdVelMsgTask(), 0,100);
                 }
 
         }).start();
 
+        // Creates a thread responsible for parsing the images received.
         new Thread(new Runnable() {
             public void run() {
                 handleImageParsing();
             }
         }).start();
 
-
-
-        // Set up the user interaction to manually show or hide the system UI.
-        /*mContentView.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                toggle();
-            }
-        });*/
-
-
-
-        // Upon interacting with UI controls, delay any scheduled hide()
-        // operations to prevent the jarring behavior of controls going away
-        // while interacting with the UI.
-//        findViewById(R.id.dummy_button).setOnTouchListener(mDelayHideTouchListener);
     }
 
+    /*
+     * Function to switch views. Most basic way to do so, by setting the visibility of the views,
+     * better ways exists and should be explored latter on.
+     */
+    private void switchViews(int view){
+        switch (view){
+            case 0:
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mStartView.setVisibility(View.VISIBLE);
+                break;
+            case 1:
+                mStartView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.VISIBLE);
+                break;
+            case 2:
+                mStartView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.VISIBLE);
+                break;
+            case 3:
+                mStartView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.VISIBLE);
+                break;
+            case 4:
+                mStartView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.VISIBLE);
+                break;
+            case 5:
+                mStartView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.VISIBLE);
+                break;
+            case 6:
+                mStartView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.VISIBLE);
+                break;
+            case 7:
+                mStartView.setVisibility(View.GONE);
+                mChooseTaskView.setVisibility(View.GONE);
+                mChooseLocationView.setVisibility(View.GONE);
+                mChooseObjectView.setVisibility(View.GONE);
+                mExecutingView.setVisibility(View.GONE);
+                mGoalAchievedView.setVisibility(View.GONE);
+                mJoystickView.setVisibility(View.GONE);
+                mFollowFacesView.setVisibility(View.VISIBLE);
+                break;
 
+        }
+    }
+
+    /*
+     * Every timer tick we test websocket connection and CMD_VEL msgs enabling flags, if booth are
+     * enabled we construct a CMD_VEL message using JSON functions and stored data in global
+     * variables.
+     */
     class sendCmdVelMsgTask extends TimerTask {
 
         @Override
@@ -140,7 +254,7 @@ public class FullscreenActivity extends AppCompatActivity {
                 try {
                     JSONObject jsonObject = new JSONObject();
                     jsonObject.put("op", "publish");
-                    jsonObject.put("topic", "/cmd_vel_mux/input/teleop");
+                    jsonObject.put("topic", TELEOP_TOPIC);
                     JSONObject jsonObjectMsg = new JSONObject();
                     JSONObject jsonObjectMsgLinear = new JSONObject();
                     jsonObjectMsgLinear.put("x", cmd_vel_linear[0]);
@@ -153,7 +267,7 @@ public class FullscreenActivity extends AppCompatActivity {
                     jsonObjectMsg.put("linear", jsonObjectMsgLinear);
                     jsonObjectMsg.put("angular", jsonObjectMsgAngular);
                     jsonObject.put("msg", jsonObjectMsg);
-                    Log.i("json", jsonObject.toString());
+                    Log.i("[sendCmdVelMsg]", jsonObject.toString());
                     mWebSocketClient.send(jsonObject.toString());
 
                 } catch (JSONException ex) {
@@ -164,6 +278,12 @@ public class FullscreenActivity extends AppCompatActivity {
         }
     };
 
+    /*
+     * This function update the stored values of the global variables used to send CMD_VEL messages.
+     * We hardcoded here maximum values for the velocities, but if desired one can change these
+     * values. We do not check the actual values used by the robot at any point. There is no closed
+     * loop control.
+     */
     private void updateCmdVel(int direction){
         switch (direction) {
             case 0:
@@ -201,190 +321,208 @@ public class FullscreenActivity extends AppCompatActivity {
         }
     }
 
-    /*@Override
-    protected void onPostCreate(Bundle savedInstanceState) {
-        super.onPostCreate(savedInstanceState);
-
-        // Trigger the initial hide() shortly after the activity has been
-        // created, to briefly hint to the user that UI controls
-        // are available.
-        delayedHide(100);
-    }*/
-
-    /**
-     * Touch listener to use for in-layout UI controls to delay hiding the
-     * system UI. This is to prevent the jarring behavior of controls going away
-     * while interacting with activity UI.
+    /*
+     * The send*() functions are called by the diverse Buttons' onCLick methods.
+     * They either set some global variable to a desired value or are used to construct messages
+     * sent to defined topics in order to start different processes on the robot.
      */
-    private final View.OnTouchListener mDelayHideTouchListener = new View.OnTouchListener() {
-        @Override
-        public boolean onTouch(View view, MotionEvent motionEvent) {
-            if (AUTO_HIDE) {
-                delayedHide(AUTO_HIDE_DELAY_MILLIS);
-            }
-            return false;
-        }
-    };
-
-    private void toggle() {
-        if (mVisible) {
-            hide();
-        } else {
-            show();
-        }
-    }
-
-    private void hide() {
-        // Hide UI first
-//        ActionBar actionBar = getSupportActionBar();
-//        if (actionBar != null) {
-//            actionBar.hide();
-//        }
-//        mControlsView.setVisibility(View.GONE);
-        mVisible = false;
-
-        // Schedule a runnable to remove the status and navigation bar after a delay
-        mHideHandler.removeCallbacks(mShowPart2Runnable);
-        mHideHandler.postDelayed(mHidePart2Runnable, UI_ANIMATION_DELAY);
-    }
-
-    private final Runnable mHidePart2Runnable = new Runnable() {
-        @SuppressLint("InlinedApi")
-        @Override
-        public void run() {
-            // Delayed removal of status and navigation bar
-
-            // Note that some of these constants are new as of API 16 (Jelly Bean)
-            // and API 19 (KitKat). It is safe to use them, as they are inlined
-            // at compile-time and do nothing on earlier devices.
-            mContentView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LOW_PROFILE
-                    | View.SYSTEM_UI_FLAG_FULLSCREEN
-                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
-        }
-    };
-
-
-    private final Runnable mHidePart3Runnable = new Runnable() {
-        @SuppressLint("InlinedApi")
-        @Override
-        public void run() {
-            // Delayed removal of status and navigation bar
-
-            // Note that some of these constants are new as of API 16 (Jelly Bean)
-            // and API 19 (KitKat). It is safe to use them, as they are inlined
-            // at compile-time and do nothing on earlier devices.
-            mContentView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LOW_PROFILE
-                    | View.SYSTEM_UI_FLAG_FULLSCREEN
-                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
-        }
-    };
-
-    @SuppressLint("InlinedApi")
-    private void show() {
-        // Show the system bar
-        mContentView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
-        mVisible = true;
-
-        // Schedule a runnable to display UI elements after a delay
-        mHideHandler.removeCallbacks(mHidePart2Runnable);
-        mHideHandler.postDelayed(mShowPart2Runnable, UI_ANIMATION_DELAY);
-    }
-
-    private final Runnable mShowPart2Runnable = new Runnable() {
-        @Override
-        public void run() {
-            // Delayed display of UI elements
-            ActionBar actionBar = getSupportActionBar();
-            if (actionBar != null) {
-                actionBar.show();
-            }
-            mControlsView.setVisibility(View.VISIBLE);
-        }
-    };
-
-    private final Handler mHideHandler = new Handler();
-    private final Runnable mHideRunnable = new Runnable() {
-        @Override
-        public void run() {
-            hide();
-        }
-    };
-
-    /**
-     * Schedules a call to hide() in [delay] milliseconds, canceling any
-     * previously scheduled calls.
-     */
-    private void delayedHide(int delayMillis) {
-        mHideHandler.removeCallbacks(mHideRunnable);
-        mHideHandler.postDelayed(mHideRunnable, delayMillis);
-    }
 
     public void sendConnect(View view){
+        // Advertise the topic to send cmds to the robot
+        try{
+            JSONObject jsonObject = new JSONObject();
+            jsonObject.put("op","advertise");
+            jsonObject.put("topic",ANDROID_CMD_TOPIC);
+            jsonObject.put("type", ANDROID_CMD_TYPE);
+            Log.i("[sendConnect]", jsonObject.toString());
+            mWebSocketClient.send(jsonObject.toString());
+        }
+        catch (JSONException ex){
+            ex.printStackTrace();
+        }
+        // Subscribe to the topic to receive feedback from the robot.
         try{
             JSONObject jsonObject = new JSONObject();
             jsonObject.put("op","subscribe");
-            jsonObject.put("topic","/Lifecam/image_raw");
-            jsonObject.put("throttle_rate", 100);
-            jsonObject.put("queue_length", 1);
-            textMsg1.setText(jsonObject.toString());
+            jsonObject.put("topic",ANDROID_FB_TOPIC);
+            // It is necessary to send the topic type in order to ensure that it will be created in
+            // case it does not exist so far.
+            jsonObject.put("type", ANDROID_FB_TYPE);
+            jsonObject.put("throttle_rate", 0);
+            jsonObject.put("queue_length", 10);
+            Log.i("[sendConnect]", jsonObject.toString());
             mWebSocketClient.send(jsonObject.toString());
         }
         catch (JSONException ex){
             ex.printStackTrace();
         }
 
+        switchViews(1);
+    }
+
+    public void sendGotoCmd(View view){
+        switchViews(2);
+    }
+
+    public void sendFollowFacesCmd(View view){
+        // Send the command to start the follow face procedure
+        try {
+            JSONObject jsonObject = new JSONObject();
+            jsonObject.put("op", "publish");
+            jsonObject.put("topic", ANDROID_CMD_TOPIC);
+            JSONObject jsonObjectData = new JSONObject();
+            jsonObjectData.put("data", "cmd_follow");
+            jsonObject.put("msg", jsonObjectData);
+            Log.i("[sendGotoMsg]", jsonObject.toString());
+            mWebSocketClient.send(jsonObject.toString());
+
+        } catch (JSONException ex) {
+            ex.printStackTrace();
+        }
+
+        switchViews(7);
+    }
+
+    public void sendJoystickCmd(View view){
+        // Advertise the topic to send cmd_vel commands
         try{
             JSONObject jsonObject = new JSONObject();
             jsonObject.put("op","advertise");
-            jsonObject.put("topic","/cmd_vel_mux/input/teleop");
-            jsonObject.put("type", "/geometry_msgs/Twist");
-            textMsg1.setText(jsonObject.toString());
+            jsonObject.put("topic", TELEOP_TOPIC);
+            jsonObject.put("type", TELEOP_TYPE);
+            Log.i("[sendJoystickCmd]", jsonObject.toString());
             mWebSocketClient.send(jsonObject.toString());
             enableCmdVelMsg = true;
         }
         catch (JSONException ex){
             ex.printStackTrace();
         }
-
-    }
-
-    public void sendDisconnect(View view){
+        // Subscribe to the raw streaming camera topic
         try{
             JSONObject jsonObject = new JSONObject();
-            jsonObject.put("op","unsubscribe");
-            jsonObject.put("topic","/Lifecam/image_raw");
-//            jsonObject.put("topic","/turtle1/cmd_vel");
-            textMsg1.setText(jsonObject.toString());
+            jsonObject.put("op","subscribe");
+            jsonObject.put("topic", CAMERA_TOPIC);
+            jsonObject.put("throttle_rate", 0);
+            jsonObject.put("queue_length", 1);
+            Log.i("[sendJoystickCmd]", jsonObject.toString());
             mWebSocketClient.send(jsonObject.toString());
         }
         catch (JSONException ex){
             ex.printStackTrace();
         }
-        try{
+        // Send the command to start the teleop procedure
+        try {
             JSONObject jsonObject = new JSONObject();
-            jsonObject.put("op","unadvertise");
-            jsonObject.put("topic","/cmd_vel_mux/input/teleop");
-            textMsg1.setText(jsonObject.toString());
+            jsonObject.put("op", "publish");
+            jsonObject.put("topic", ANDROID_CMD_TOPIC);
+            JSONObject jsonObjectData = new JSONObject();
+            jsonObjectData.put("data", "cmd_teleop");
+            jsonObject.put("msg", jsonObjectData);
+            Log.i("[sendGotoMsg]", jsonObject.toString());
             mWebSocketClient.send(jsonObject.toString());
-            enableCmdVelMsg = false;
-        }
-        catch (JSONException ex){
+
+        } catch (JSONException ex) {
             ex.printStackTrace();
         }
 
+        switchViews(6);
     }
 
+    // Cmd go to related buttons
+    public void sendLocation1(View view){
+        location = "grasp_lab";
+        switchViews(3);
+    }
 
+    public void sendLocation2(View view){
+        location = "charitys_office";
+        switchViews(3);
+    }
+
+    public void sendLocation3(View view){
+        location = "jeans_office";
+        switchViews(3);
+    }
+
+    public void sendLocation4(View view){
+        location = "vending_machine";
+        switchViews(3);
+    }
+
+    public void sendObject1(View view){
+        object = "keyboard";
+        sendGotoMsg();
+        switchViews(4);
+    }
+
+    public void sendObject2(View view){
+        object = "ball";
+        sendGotoMsg();
+        switchViews(4);
+    }
+
+    public void sendObject3(View view){
+        object = "magazine";
+        sendGotoMsg();
+        switchViews(4);
+    }
+/*
+    public void sendObject4(View view){
+        object = "Object4";
+        sendGotoMsg();
+        switchViews(4);
+    }*/
+
+    public void sendGotoMsg(){
+        // Send command to go to an specific location and find an specific object
+        try {
+            JSONObject jsonObject = new JSONObject();
+            jsonObject.put("op", "publish");
+            jsonObject.put("topic", ANDROID_CMD_TOPIC);
+            JSONObject jsonObjectData = new JSONObject();
+            jsonObjectData.put("data", "cmd_goto " + location + " " + object);
+            jsonObject.put("msg", jsonObjectData);
+            Log.i("[sendGotoMsg]", jsonObject.toString());
+            mWebSocketClient.send(jsonObject.toString());
+
+        } catch (JSONException ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    /*public void sendFinishLocation(View view){
+        switchViews(1);
+    }
+
+    public void sendFinishObject(View view){
+        switchViews(1);
+    }
+*/
+  /*  public void sendFinishExecuting(View view){
+        switchViews(5);
+    }
+*/
+    // Send a command to finish executing some procedures and return to an idle state
+    public void sendFinish(View view){
+        try {
+            JSONObject jsonObject = new JSONObject();
+            jsonObject.put("op", "publish");
+            jsonObject.put("topic", ANDROID_CMD_TOPIC);
+            JSONObject jsonObjectData = new JSONObject();
+            jsonObjectData.put("data", "cmd_idle");
+            jsonObject.put("msg", jsonObjectData);
+            Log.i("[sendGotoMsg]", jsonObject.toString());
+            mWebSocketClient.send(jsonObject.toString());
+
+        } catch (JSONException ex) {
+            ex.printStackTrace();
+        }
+        switchViews(1);
+    }
+
+    // Cmd teleop related buttons
     public void sendMoveUp(View view){
         updateCmdVel(1);
-
     }
     public void sendMoveDown(View view){
         updateCmdVel(2);
@@ -400,6 +538,48 @@ public class FullscreenActivity extends AppCompatActivity {
         updateCmdVel(0);
     }
 
+    public void sendJoystickFinish(View view){
+        // Unsubscribe from the raw image topic
+        try{
+            JSONObject jsonObject = new JSONObject();
+            jsonObject.put("op","unsubscribe");
+            jsonObject.put("topic", CAMERA_TOPIC);
+            Log.i("[sendJoystickFinish]", jsonObject.toString());
+            mWebSocketClient.send(jsonObject.toString());
+        }
+        catch (JSONException ex){
+            ex.printStackTrace();
+        }
+        // Stop advertising the topic to send cmd_vel msgs
+        try{
+            JSONObject jsonObject = new JSONObject();
+            jsonObject.put("op","unadvertise");
+            jsonObject.put("topic", TELEOP_TOPIC);
+            Log.i("[sendJoystickFinish]", jsonObject.toString());
+            mWebSocketClient.send(jsonObject.toString());
+            enableCmdVelMsg = false;
+        }
+        catch (JSONException ex){
+            ex.printStackTrace();
+        }
+
+        switchViews(1);
+    }
+
+    /*
+     * This functions is our first attempt to parse the raw image streaming feed received.
+     * The idea was to try processing all received frames in a bitmap and show it on the screen as
+     * soon as the image processing was done. In order to do so, we execute this function in an
+     * independent thread and just call the UIthread to draw the bitmap in the end.
+     *
+     * This function has two major problems:
+     * - The image colors are wrong. We believe that there is YUV 4:2:2 or 4:2:0 compression that we
+     * do not decode.
+     * - There is a significant amount of delay in the image shown.
+     *
+     * In order to solve such problems we believe that one should encode the feed with h.264 or
+     * vp8 codec and later use Android's media decoder.
+     */
     private void handleImageParsing(){
         while(true){
             if(hasImage){
@@ -424,6 +604,7 @@ public class FullscreenActivity extends AppCompatActivity {
                 //                            intBuf.get(argb);
 
                 final Bitmap image = Bitmap.createBitmap(argb, old_one.width, old_one.height, Bitmap.Config.ARGB_8888);
+                // Call for UIthread
                 imageView.post(new Runnable() {
                     public void run() {
                         imageView.setImageBitmap(image);
@@ -433,7 +614,14 @@ public class FullscreenActivity extends AppCompatActivity {
         }
     }
 
-
+    /*
+     * The basic format of the following function was obtained from an example of its library and
+     * modified to our needs. We are able to create and establish a websocket connection without
+     * security protocols, send and receive messages. Future work here should include:
+     * - use of wss protocol instead of ws.
+     * - use of the authentication frame available in rosbridge.
+     * - verification of exceptions and errors that may occur.
+     */
     private void connectWebSocket() {
         URI uri;
         try {
@@ -443,13 +631,10 @@ public class FullscreenActivity extends AppCompatActivity {
             return;
         }
 
-//        textMsg2.setText("URI");
-
         mWebSocketClient = new WebSocketClient(uri) {
             @Override
             public void onOpen(ServerHandshake serverHandshake) {
                 Log.i("Websocket", "Opened");
-
                 mWebSocketStatus = true;
             }
 
@@ -458,16 +643,49 @@ public class FullscreenActivity extends AppCompatActivity {
                 final String msg = s;
 //                new Thread(new Runnable() {
 //                    public void run() {
-
+                // We parse the topic information of each message in order to call the desired
+                // procedures.
+                        Log.i("[onMessage]", msg);
                         try {
                             JSONObject jsonObject = new JSONObject(msg);
-                            new_one.height = jsonObject.getJSONObject("msg").getInt("height");
-                            new_one.width = jsonObject.getJSONObject("msg").getInt("width");
-                            new_one.data = jsonObject.getJSONObject("msg").getString("data").getBytes();
-                            hasImage = true;
+                            String topic = jsonObject.getString("topic");
+                            if(topic.equals(CAMERA_TOPIC)) {
+                                new_one.height = jsonObject.getJSONObject("msg").getInt("height");
+                                new_one.width = jsonObject.getJSONObject("msg").getInt("width");
+                                new_one.data = jsonObject.getJSONObject("msg").getString("data").getBytes();
+                                hasImage = true;
 
-                            Log.i("[INFO height]", Integer.toString(new_one.height));
-                            Log.i("[INFO width]", Integer.toString(new_one.width));
+                                Log.i("[INFO height]", Integer.toString(new_one.height));
+                                Log.i("[INFO width]", Integer.toString(new_one.width));
+                            }
+                            else if(topic.equals(ANDROID_FB_TOPIC)){
+                                String data = jsonObject.getJSONObject("msg").getString("data");
+                                String text = "Did not receive correct msg!";
+                                if(data.contains("location: success"))
+                                     text = " I was able to arrive at desired location!\n";
+                                else
+                                    text = " I was not able to arrive at desired location!\n";
+
+                                if(data.contains("object: success"))
+                                    text = text + " I found the object!";
+                                else
+                                    text = text + " I could not find the object!";
+
+                                final String text2 = text;
+                                goalTextView.post(new Runnable() {
+                                    public void run() {
+                                        goalTextView.setText(text2);
+                                    }
+                                });
+                                if(data.contains("location:") && data.contains("object:"))
+                                    runOnUiThread(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            switchViews(5);
+                                        }
+                                    });
+
+                            }
 
                         } catch (JSONException ex) {
                             ex.printStackTrace();
